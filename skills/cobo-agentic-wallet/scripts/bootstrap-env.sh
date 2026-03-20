@@ -126,8 +126,34 @@ sha256_file() {
 download_with_resume() {
   local url="$1"
   local dest="$2"
+  local max_retries="${3:-2}"
+  local connect_timeout="${DOWNLOAD_CONNECT_TIMEOUT:-15}"
+  local max_time="${DOWNLOAD_MAX_TIME:-240}"
   mkdir -p "$(dirname "$dest")"
-  curl --fail --location --silent --show-error --continue-at - --output "$dest" "$url"
+
+  local attempt=0
+  while (( attempt < max_retries )); do
+    ((attempt++))
+    # Remove partial file before fresh attempt to avoid resuming a corrupted download
+    [[ -f "$dest" ]] && rm -f "$dest"
+    if curl --fail --location --silent --show-error \
+         --connect-timeout "$connect_timeout" \
+         --max-time "$max_time" \
+         --retry 2 --retry-delay 3 \
+         --output "$dest" "$url"; then
+      # Verify download is non-empty
+      if [[ -s "$dest" ]]; then
+        return 0
+      fi
+      echo "[WARN] Downloaded file is empty: $dest (attempt $attempt/$max_retries)" >&2
+    else
+      echo "[WARN] Download failed: $url (attempt $attempt/$max_retries, curl exit=$?)" >&2
+    fi
+    rm -f "$dest"
+    (( attempt < max_retries )) && sleep 3
+  done
+  echo "[ERROR] Download failed after $max_retries attempts: $url" >&2
+  return 1
 }
 
 fetch_remote_meta() {
@@ -170,9 +196,26 @@ should_download_artifact() {
   return 0
 }
 
+verify_tarball() {
+  local tarball="$1"
+  local label="$2"
+  if [[ ! -s "$tarball" ]]; then
+    echo "[ERROR] $label tarball is empty or missing: $tarball" >&2
+    return 1
+  fi
+  # Quick gzip integrity check
+  if ! gzip -t "$tarball" 2>/dev/null; then
+    echo "[ERROR] $label tarball is corrupted (gzip check failed): $tarball" >&2
+    rm -f "$tarball"
+    return 1
+  fi
+  return 0
+}
+
 extract_caw_assets() {
   local tarball="$1"
   local dest_dir="$2"
+  verify_tarball "$tarball" "caw" || return 1
   local tmp_dir
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' RETURN
@@ -197,6 +240,7 @@ extract_caw_assets() {
 
 extract_tss_assets() {
   local tarball="$1"
+  verify_tarball "$tarball" "tss" || return 1
   local tmp_dir
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' RETURN
@@ -233,7 +277,11 @@ wait_job_or_fail() {
   local log_path="$2"
   local label="$3"
   if ! wait "$pid"; then
-    echo "[ERROR] ${label} failed. See log: ${log_path}" >&2
+    echo "[ERROR] ${label} failed (exit=$?)." >&2
+    echo "[ERROR] Log contents:" >&2
+    tail -20 "$log_path" 2>/dev/null >&2 || true
+    echo "[HINT] Possible causes: network timeout, DNS failure, firewall blocking download.agenticwallet.cobo.com or download.tss.cobo.com." >&2
+    echo "[HINT] Re-run with --force-download to retry. If it fails again, check network connectivity." >&2
     exit 1
   fi
 }
@@ -242,12 +290,16 @@ main() {
   read -r os arch < <(detect_platform)
   mkdir -p "$BIN_DIR" "$LOG_DIR" "$CACHE_TSS_DIR"
 
-  # Early exit: if both caw and tss-node exist and no force-download, skip download
+  # Early exit: if both caw and tss-node exist, are executable, and non-empty, skip download
   if [[ "$FORCE_DOWNLOAD" != "true" ]]; then
-    if [[ -x "$BIN_DIR/caw" ]] && [[ -x "$CACHE_TSS_DIR/cobo-tss-node" ]]; then
+    if [[ -x "$BIN_DIR/caw" ]] && [[ -s "$BIN_DIR/caw" ]] \
+       && [[ -x "$CACHE_TSS_DIR/cobo-tss-node" ]] && [[ -s "$CACHE_TSS_DIR/cobo-tss-node" ]]; then
       echo "ready"
       exit 0
     fi
+    # Clean up any zero-byte or non-executable binaries from failed downloads
+    [[ -f "$BIN_DIR/caw" ]] && [[ ! -s "$BIN_DIR/caw" ]] && rm -f "$BIN_DIR/caw"
+    [[ -f "$CACHE_TSS_DIR/cobo-tss-node" ]] && [[ ! -s "$CACHE_TSS_DIR/cobo-tss-node" ]] && rm -f "$CACHE_TSS_DIR/cobo-tss-node"
   fi
 
   local caw_url="${CAW_BASE_URL}/${CAW_VERSION}/caw-${os}-${arch}-${CAW_VERSION}.tar.gz"

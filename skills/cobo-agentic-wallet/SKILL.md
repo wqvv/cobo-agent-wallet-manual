@@ -12,11 +12,46 @@ description: |
 
 Cobo Agentic Wallet is a policy-enforced crypto wallet for AI agents. Owners set spending limits and approve transactions; agents operate within those guardrails. The `caw` CLI is the primary interface.
 
+## Execution Rules (CRITICAL — read before running any command)
+
+1. **No re-execution.** Run each command exactly once. If a command is still running, wait for it to exit — do NOT launch it again in a new session.
+2. **No polling loops.** Both `bootstrap-env.sh` and `caw onboard` print progress to stdout as they run and exit on completion. Wait for exit code — do NOT poll, re-run, or check output in a loop.
+3. **Expect long waits.** `bootstrap-env.sh` first run: 60–120s (downloads ~8MB caw + ~30MB TSS Node). `caw onboard`: 50–60s. On slow networks or cloud VMs, these may take up to **180s**. Set timeout to **300s** to be safe. These durations are normal — do NOT treat a long wait as a failure.
+4. **One command at a time.** Do not start `caw onboard` until `bootstrap-env.sh` has exited. Do not start a transfer until `onboard` has exited.
+5. **Report progress to the user BEFORE each long-running command.** The user cannot see command output while it runs. Send a text message to the user before and after every step that takes >5s. Follow this template:
+   - Before bootstrap: `"⏳ Downloading wallet tools (caw + TSS Node)... This takes 60–120 seconds on first run."`
+   - After bootstrap: `"✅ Tools installed. Now creating your wallet..."`
+   - Before onboard: `"⏳ Creating wallet (registering agent → initializing TSS → generating keys)... About 60 seconds."`
+   - After onboard: `"✅ Wallet created! Wallet ID: {id}. Checking status..."`
+   - After wallet active: `"✅ Your wallet is active and ready to use. Address: {address}"`
+   - On error: `"❌ {step} failed: {error}. {hint from stderr if available}"`
+   This keeps the user informed during the 2–3 minute setup process instead of leaving them in silence.
+6. **On timeout or failure — do NOT retry blindly.** Follow this decision tree:
+   ```
+   bootstrap-env.sh exited non-zero or timed out?
+   ├─ Check: ls -la ~/.cobo-agentic-wallet/bin/caw ~/.cobo-agentic-wallet/cache/tss-node/cobo-tss-node
+   ├─ Both exist AND size > 0?  → Bootstrap succeeded. Continue to onboard.
+   ├─ One or both missing/empty? → Re-run ONCE: ./scripts/bootstrap-env.sh --env sandbox --force-download
+   │   ├─ Second run succeeds?   → Continue to onboard.
+   │   └─ Second run fails?      → STOP. Report error + log tail to user. Do NOT retry again.
+   └─ Check stderr for "[HINT]" lines — they describe the root cause (DNS, firewall, timeout).
+   ```
+
 ## Bootstrap
 
-Run `./scripts/bootstrap-env.sh --env sandbox` to install caw and TSS Node (download sources are built into the script). caw → `~/.cobo-agentic-wallet/bin/caw`; add that dir to PATH.
+Run the bootstrap script once to install caw and TSS Node:
 
-**Rule:** Before any onboard, run bootstrap and wait for `ready` or `[3/3] Done`. If caw and tss-node already exist, script exits immediately with `ready`.
+```bash
+./scripts/bootstrap-env.sh --env sandbox
+```
+
+caw installs to `~/.cobo-agentic-wallet/bin/caw`; add that dir to PATH.
+
+- **First run**: Downloads caw binary (~8MB) and TSS Node (~30MB) in parallel. Takes 60–120s on fast networks, up to 180s on slow connections. Prints `[3/3] Done` on success.
+- **Subsequent runs**: Detects cached binaries, prints `ready`, exits immediately.
+- **Run once and wait for exit.** Do NOT re-run, poll, or check status separately. The script handles everything internally.
+- **Timeout**: Use `timeout 300s ./scripts/bootstrap-env.sh --env sandbox` or set your exec timeout to 300000ms. The extra margin prevents premature kills on slow cloud networks.
+- **Tell the user first.** Before running bootstrap, send: `"⏳ Downloading wallet tools (caw + TSS Node)... This takes 60–120 seconds on first run."` After it exits: `"✅ Tools installed successfully."` or report the error.
 
 **Prompt → action:**
 
@@ -26,7 +61,7 @@ Run `./scripts/bootstrap-env.sh --env sandbox` to install caw and TSS Node (down
 | `BootStrap a new Cobo Agentic Wallet with invitation code <CODE>` | Then `caw onboard --create-wallet --invitation-code <CODE> --env sandbox` |
 | `BootStrap a new Cobo Agentic Wallet` (no token/code) | Run invite-code flow (see below); once code is available, `caw onboard --create-wallet --invitation-code <CODE> --env sandbox` |
 
-**General:** Onboard ~50-60s. See [Error Handling](./recipes/error-handling.md#onboarding-errors).
+See [Error Handling](./recipes/error-handling.md#onboarding-errors) for bootstrap failures.
 
 ## Environment
 
@@ -42,16 +77,21 @@ export AGENT_WALLET_API_URL=https://api-agent-wallet-core.sandbox.cobo.com
 
 ## Onboarding
 
+All onboard commands take 50–60s. Run once with a **180s timeout** and wait for exit. The command prints progress steps (`[1/5]`…`[5/5]`) to stdout as it runs.
+
+**User communication:** Tell the user what's happening before you run onboard. Example:
+> ⏳ Creating your wallet now. This involves 5 steps (agent registration → TSS download → TSS initialization → TSS startup → MPC wallet creation) and takes about 60 seconds. I'll let you know as soon as it's ready.
+
 ### Autonomous onboarding (invitation code)
 
-1. After bootstrap-env ready, run:
+1. After bootstrap-env exits successfully, run:
 
 ```bash
 export PATH="$HOME/.cobo-agentic-wallet/bin:$PATH"
 caw --format table onboard --create-wallet --env sandbox --invitation-code <INVITATION_CODE>
 ```
 
-~60s: Register → Init TSS → Start TSS → Create wallet. Wallet ready.
+~60s: Register → Init TSS → Start TSS → Create wallet. Wallet ready when command exits.
 
 ### Invite-code acquisition (when no token/code)
 
@@ -64,7 +104,7 @@ caw --format table onboard --create-wallet --env sandbox --invitation-code <INVI
 Fill in `agent_name`, `agent_description`, `email`, `telegram` and run the printed curl.
 2. Ask human to open returned `auth_url` and complete X login.
 3. After approval, invite code is sent via X DM.
-4. After bootstrap-env ready, run:
+4. After bootstrap-env exits successfully, run:
 
 ```bash
 export PATH="$HOME/.cobo-agentic-wallet/bin:$PATH"
@@ -75,7 +115,7 @@ caw --format table onboard --create-wallet --env sandbox --invitation-code <INVI
 
 Human initiates from Web Console, provides setup token.
 
-1. After bootstrap-env ready:
+1. After bootstrap-env exits successfully:
 
 ```bash
 export PATH="$HOME/.cobo-agentic-wallet/bin:$PATH"
@@ -152,7 +192,7 @@ caw --format json pending get <operation_id>
   caw --format json wallet balance --address <gas-address> --chain <CHAIN>
   ```
   If the balance is low, warn the user and top it up from wherever funds are available before proceeding.
-- **Long-running commands** (`caw onboard --create-wallet`): run in background, poll output every 10–15s, report each `[n/total]` progress step.
+- **No retry loops.** If a `caw` command fails (non-zero exit), read stderr, diagnose the issue, and fix it before running again. Do NOT blindly retry the same command.
 - **TSS Node auto-start**: `caw tx transfer` and `caw tx call` automatically check TSS Node status and start it if offline. `caw node stop` checks for pending transactions — use `--force` to skip.
 - **wallet_uuid is optional** in most commands — if omitted, the CLI uses the active profile's wallet.
 - **StandardResponse format** — API responses are wrapped as `{ success: true, result: <data> }`. Extract from `result` first.
